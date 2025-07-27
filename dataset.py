@@ -7,9 +7,7 @@ from sklearn.model_selection import train_test_split
 import numpy as np
 import ujson
 
-## Todo: Change the data partition universally
 def prepare_data(args):
-
     if args.dataset == "tinyimagenet":
         trainset, testset = tinyimagenet_dataset(args)
     elif args.dataset == "cifar100":
@@ -20,17 +18,21 @@ def prepare_data(args):
         trainset, testset = None, None
         print("Unavailable dataset!")
         return
-    config_path = args.datadir + "config.json"
-    train_path = args.datadir + "train/"
-    test_path = args.datadir + "test/"
-
+    
     np.random.seed(args.seed)
-    data_idx_train, y, statistic = separate_data(trainset, testset, args.num_clients, args.num_classes,
-                                    args.niid, args.balance, args.partition, args.alpha, args.shred)
-    # print(statistic)
-
-    # torch.manual_seed(args.seed)
-    return trainset, data_idx_train, testset
+    
+    if args.dataset == "cifar100" and args.continual:
+        # Special handling for CIFAR-100 continual learning setup
+        data_idx_train, task_info, statistic = separate_data_continual(
+            trainset, testset, args.num_clients, args.num_classes, 
+            args.tasks_per_client, args.classes_per_task, args.seed)
+        return trainset, data_idx_train, testset, task_info
+    else:
+        # Original code for other datasets
+        data_idx_train, y, statistic = separate_data(
+            trainset, testset, args.num_clients, args.num_classes,
+            args.niid, args.balance, args.partition, args.alpha, args.shred)
+        return trainset, data_idx_train, testset, None
 
 def tinyimagenet_dataset(args):
     # Data loading code
@@ -44,7 +46,6 @@ def tinyimagenet_dataset(args):
         traindir,
         transforms.Compose([
             transforms.Resize(224),
-            # transforms.RandomHorizontalFlip(),
             transforms.ToTensor(),
             normalize,
         ]))
@@ -53,7 +54,6 @@ def tinyimagenet_dataset(args):
         valdir,
         transforms.Compose([
             transforms.Resize(224),
-            # transforms.CenterCrop(224),
             transforms.ToTensor(),
             normalize,
         ]))
@@ -66,7 +66,6 @@ def cifar100_dataset(args):
             transforms.Resize(224),
             transforms.ToTensor(),
             transforms.Normalize((0.5,0.5,0.5), (0.5,0.5,0.5))
-            # transforms.Normalize((0.507, 0.487, 0.441), (0.267, 0.256, 0.276))
         ])
 
     val_transform = transforms.Compose(
@@ -81,19 +80,14 @@ def cifar100_dataset(args):
     val_dataset = datasets.CIFAR100(
         root=args.data + "/cifar100", train=False, download=True, transform=train_transform)
 
-
     return train_dataset, val_dataset
+
 def cifar10_dataset(args):
     train_transform = transforms.Compose(
         [
-            # transforms.RandomResizedCrop(224),
-            # transforms.AutoAugment(transforms.AutoAugmentPolicy.CIFAR10),
             transforms.Resize(224),
-            # transforms.CenterCrop(224),
             transforms.ToTensor(),
-            # transforms.Normalize((0.507, 0.487, 0.441), (0.267, 0.256, 0.276))
             transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
-
         ])
 
     val_transform = transforms.Compose(
@@ -111,38 +105,86 @@ def cifar10_dataset(args):
 
     return train_dataset, val_dataset
 
-class ImageFolder_custom(DatasetFolder):
-    def __init__(self, root, dataidxs=None, train=True, transform=None, target_transform=None):
-        self.root = root
-        self.dataidxs = dataidxs
-        self.train = train
-        self.transform = transform
-        self.target_transform = target_transform
+def separate_data_continual(data, data_test, num_clients, num_classes, tasks_per_client, classes_per_task, seed):
+    """
+    Create continual learning setup for CIFAR-100:
+    - 10 clients
+    - Each client has 4 tasks
+    - Each task has 20 randomly selected classes
+    """
+    np.random.seed(seed)
+    
+    dataset_label_train = data.targets
+    dataset_label = np.array(dataset_label_train)
+    
+    # Get indices for each class
+    idxs = np.array(range(len(dataset_label)))
+    idx_for_each_class = []
+    for i in range(num_classes):
+        idx_for_each_class.append(idxs[dataset_label == i])
+    
+    # Initialize storage
+    dataidx_map = {}  # client_id -> list of indices
+    task_info = {}    # client_id -> list of tasks, each task is a list of classes
+    statistic = {}    # client_id -> statistics
+    
+    # All available classes
+    all_classes = list(range(num_classes))
+    
+    for client in range(num_clients):
+        client_indices = []
+        client_tasks = []
+        client_stats = []
+        
+        # Create tasks for this client
+        for task in range(tasks_per_client):
+            # Randomly select classes for this task
+            task_classes = np.random.choice(all_classes, size=classes_per_task, replace=False)
+            task_classes = sorted(task_classes.tolist())
+            client_tasks.append(task_classes)
+            
+            # Collect all indices for these classes
+            task_indices = []
+            task_stats = []
+            
+            for class_id in task_classes:
+                class_indices = idx_for_each_class[class_id]
+                # Randomly sample some data from this class for this client
+                # Each client gets approximately 1/num_clients of each class data
+                num_samples = len(class_indices) // num_clients
+                if num_samples > 0:
+                    selected_indices = np.random.choice(class_indices, size=num_samples, replace=False)
+                    task_indices.extend(selected_indices.tolist())
+                    task_stats.append((int(class_id), len(selected_indices)))
+            
+            client_indices.extend(task_indices)
+            client_stats.append(task_stats)
+        
+        dataidx_map[client] = np.array(client_indices)
+        task_info[client] = client_tasks
+        statistic[client] = client_stats
+    
+    # Convert to format expected by the rest of the code
+    data_idx = []
+    for client in range(num_clients):
+        data_idx.append(torch.from_numpy(dataidx_map[client]))
+    
+    # Print statistics
+    print("\n" + "="*50)
+    print("Continual Learning Setup Summary:")
+    print(f"Number of clients: {num_clients}")
+    print(f"Tasks per client: {tasks_per_client}")
+    print(f"Classes per task: {classes_per_task}")
+    print("="*50)
+    
+    for client in range(num_clients):
+        print(f"\nClient {client}:")
+        for task_id, (task_classes, task_stats) in enumerate(zip(task_info[client], statistic[client])):
+            print(f"  Task {task_id}: Classes {task_classes}")
+            print(f"    Total samples: {sum([stat[1] for stat in task_stats])}")
+    
+    return data_idx, task_info, statistic
 
-        imagefolder_obj = ImageFolder(self.root, self.transform, self.target_transform)
-        self.loader = imagefolder_obj.loader
-        if self.dataidxs is not None:
-            self.samples = np.array(imagefolder_obj.samples)[self.dataidxs]
-        else:
-            self.samples = np.array(imagefolder_obj.samples)
-
-    def __getitem__(self, index):
-        path = self.samples[index][0]
-        target = self.samples[index][1]
-        target = int(target)
-        sample = self.loader(path)
-        if self.transform is not None:
-            sample = self.transform(sample)
-        if self.target_transform is not None:
-            target = self.target_transform(target)
-
-        return sample, target
-
-    def __len__(self):
-        if self.dataidxs is None:
-            return len(self.samples)
-        else:
-            return len(self.dataidxs)
 def separate_data(data, data_test, num_clients, num_classes, niid=False, balance=False, partition=None, alpha = 0.1,least_samples=1,class_per_client = 10):
     X = [[] for _ in range(num_clients)]
     y = [[] for _ in range(num_clients)]
@@ -199,10 +241,6 @@ def separate_data(data, data_test, num_clients, num_classes, niid=False, balance
 
         try_cnt = 1
         while min_size < least_samples:
-        #     if try_cnt > 1:
-        #         print(
-        #             f'Client data size does not meet the minimum requirement {least_samples}. Try allocating again for the {try_cnt}-th time.')
-
             idx_batch = [[] for _ in range(num_clients)]
             for k in range(K):
                 idx_k = np.where(dataset_label == k)[0]
@@ -225,46 +263,43 @@ def separate_data(data, data_test, num_clients, num_classes, niid=False, balance
         idxs = dataidx_map[client]
         idxs = np.array(idxs)
         y[client] = dataset_label[idxs]
-        # idxs_train, idxs_test, y_train, y_test = train_test_split(
-        #     idxs, y[client], train_size=train_size, shuffle=True)
         data_idx.append(torch.from_numpy(idxs))
         for i in np.unique(y[client]):
             statistic[client].append((int(i), int(sum(y[client] == i))))
 
     del data, data_test
-    # gc.collect()
-
-    # for client in range(num_clients):
-    #     print(f"Client {client}\t Size of data: {len(y[client])}\t Labels: ", np.unique(y[client]))
-    #     print(f"\t\t Samples of labels: ", [i for i in statistic[client]])
-    #     print("-" * 50)
 
     return data_idx, y, statistic
 
+class ImageFolder_custom(DatasetFolder):
+    def __init__(self, root, dataidxs=None, train=True, transform=None, target_transform=None):
+        self.root = root
+        self.dataidxs = dataidxs
+        self.train = train
+        self.transform = transform
+        self.target_transform = target_transform
 
-# def save_file(config_path, train_path, test_path, train_data, test_data, num_clients,
-#               num_classes, statistic, niid=False, balance=True, partition=None,alpha=0.1,batch_size=128):
-#     config = {
-#         'num_clients': num_clients,
-#         'num_classes': num_classes,
-#         'non_iid': niid,
-#         'balance': balance,
-#         'partition': partition,
-#         'Size of samples for labels in clients': statistic,
-#         'alpha': alpha,
-#         'batch_size': batch_size,
-#     }
-#
-#     # gc.collect()
-#     print("Saving to disk.\n")
-#
-#     for idx, train_dict in enumerate(train_data):
-#         with open(train_path + str(idx) + '.npz', 'wb') as f:
-#             np.savez_compressed(f, data=train_dict)
-#     for idx, test_dict in enumerate(test_data):
-#         with open(test_path + str(idx) + '.npz', 'wb') as f:
-#             np.savez_compressed(f, data=test_dict)
-#     with open(config_path, 'w') as f:
-#         ujson.dump(config, f)
-#
-#     print("Finish generating dataset.\n")
+        imagefolder_obj = ImageFolder(self.root, self.transform, self.target_transform)
+        self.loader = imagefolder_obj.loader
+        if self.dataidxs is not None:
+            self.samples = np.array(imagefolder_obj.samples)[self.dataidxs]
+        else:
+            self.samples = np.array(imagefolder_obj.samples)
+
+    def __getitem__(self, index):
+        path = self.samples[index][0]
+        target = self.samples[index][1]
+        target = int(target)
+        sample = self.loader(path)
+        if self.transform is not None:
+            sample = self.transform(sample)
+        if self.target_transform is not None:
+            target = self.target_transform(target)
+
+        return sample, target
+
+    def __len__(self):
+        if self.dataidxs is None:
+            return len(self.samples)
+        else:
+            return len(self.dataidxs)

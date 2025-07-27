@@ -65,10 +65,32 @@ parser.add_argument( '--rg', default=0, type=float,
                     help='regularization factor of analytic learning')
 parser.add_argument( '--clean_reg',  dest='clean_reg', action='store_true',
                     help='clean regularization factor after aggregation')
+# Continual Learning Setup
+parser.add_argument('--continual', dest='continual', action='store_true',
+                    help='enable continual learning setup')
+parser.add_argument('--tasks_per_client', default=4, type=int,
+                    help='number of tasks per client in continual learning')
+parser.add_argument('--classes_per_task', default=20, type=int,
+                    help='number of classes per task in continual learning')
+
 best_acc1 = 0
 
 def main():
     args = parser.parse_args()
+
+    # For CIFAR-100 continual learning, override settings
+    if args.dataset == 'cifar100' and args.continual:
+        args.num_clients = 10
+        args.tasks_per_client = 4
+        args.classes_per_task = 20
+        args.niid = False  # Remove non-iid configuration
+        print("="*50)
+        print("CIFAR-100 Continual Learning Configuration:")
+        print(f"  Number of clients: {args.num_clients}")
+        print(f"  Tasks per client: {args.tasks_per_client}")
+        print(f"  Classes per task: {args.classes_per_task}")
+        print("  Non-IID setting: Disabled")
+        print("="*50)
 
     if args.seed is not None:
         random.seed(args.modelseed)
@@ -82,7 +104,6 @@ def main():
                       'You may see unexpected behavior when restarting '
                       'from checkpoints.')
 
-        # Simply call main_worker function
     if args.gpu is not None:
         print("Use GPU: {} for training".format(args.gpu))
 
@@ -99,8 +120,14 @@ def main():
         model = resnet.__dict__[args.arch]()
     model = model.cuda(args.gpu)
 
-    # dataset spliting
-    train_total, train_data_idx, testset = prepare_data(args)
+    # dataset splitting
+    result = prepare_data(args)
+    if args.continual and args.dataset == 'cifar100':
+        train_total, train_data_idx, testset, task_info = result
+    else:
+        train_total, train_data_idx, testset = result
+        task_info = None
+    
     random.seed(args.modelseed)
     torch.manual_seed(args.modelseed)
     train_dataset = []
@@ -113,62 +140,114 @@ def main():
     local_weights, local_R, local_C = [], [], []
     local_models = []
     local_train_acc = []
+    
+    print("\n" + "="*50)
     print("Training locally!")
+    print("="*50)
+    
     start = time.time()
+    
     for idx in range(args.num_clients):
-        train_loader = torch.utils.data.DataLoader(train_dataset[idx],args.batch_size,drop_last=False,shuffle=True,num_workers=8)
-        #train locally
-        W, R, C = local_update(train_loader,model,global_model,args)
+        print(f"\nClient #{idx}:")
+        
+        if args.continual and task_info is not None:
+            # For continual learning, show task information
+            print(f"  Tasks for this client:")
+            for task_id, task_classes in enumerate(task_info[idx]):
+                print(f"    Task {task_id}: Classes {task_classes}")
+        
+        train_loader = torch.utils.data.DataLoader(
+            train_dataset[idx], 
+            args.batch_size, 
+            drop_last=False, 
+            shuffle=True, 
+            num_workers=8
+        )
+        
+        # Train locally
+        W, R, C = local_update(train_loader, model, global_model, args)
         local_model = init_local(args)
         local_model.fc.weight = torch.nn.parameter.Parameter(torch.t(W.float()))
         local_models.append(local_model)
+        
+        # Validate
         correct, num_sample = validate(train_loader, model, local_model.cuda(), args)
         acc = correct / num_sample
         W = W.cpu()
-        # correct_val, num_sample_val = validate(val_loader, model, local_model, args)
-        # acc_val = correct_val / num_sample_val
-        print("Training Accuracy at training set on Client #{}: {}%".format(idx, acc * 100))
+        
+        print(f"  Training Accuracy: {acc * 100:.2f}%")
+        print(f"  Number of samples: {num_sample}")
+        
         local_weights.append(W)
         local_R.append(R)
         local_C.append(C)
         local_train_acc.append(acc.cpu().item())
+    
     endtime = time.time() - start
-    print("Elapsing time for local training: {}%".format(endtime))
-    #aggregation
+    print(f"\nElapsing time for local training: {endtime:.2f} seconds")
+    
+    # Aggregation
+    print("\n" + "="*50)
     print("Aggregating!")
+    print("="*50)
+    
     global_weight, global_R, global_C = aggregation(local_weights, local_R, local_C, args)
     print('Aggregation done!')
     global_model.fc.weight = torch.nn.parameter.Parameter(torch.t(global_weight.float()))
 
-    #Evaluate the global model
+    # Evaluate the global model
+    print("\n" + "="*50)
     print("Evaluating global model!")
-
+    print("="*50)
 
     val_loader = torch.utils.data.DataLoader(testset, args.batch_size, drop_last=False, shuffle=True, num_workers=8)
-    correct, num_sample = validate(val_loader, model, global_model,args)
-    acc = correct/num_sample * 100
-    endtime_1 = time.time()-start
-    print("Elapsing time for training and aggregation: {}%".format(endtime_1))
-    print("Average accuracy on all Client: {}%".format(acc))
+    correct, num_sample = validate(val_loader, model, global_model, args)
+    acc = correct / num_sample * 100
+    endtime_1 = time.time() - start
+    
+    print(f"\nElapsing time for training and aggregation: {endtime_1:.2f} seconds")
+    print(f"Average accuracy on test set: {acc:.2f}%")
+    print(f"Average local training accuracy: {np.mean(local_train_acc) * 100:.2f}%")
+    
     acc_c = -100
     if args.clean_reg:
+        print("\n" + "="*50)
+        print("Cleaning regularization...")
+        print("="*50)
+        
         global_weight_clean = clean_regularization(global_weight, global_C, args)
         global_model.fc.weight = torch.nn.parameter.Parameter(torch.t(global_weight_clean.float()))
         val_loader = torch.utils.data.DataLoader(testset, args.batch_size, drop_last=False, shuffle=True)
         correct_c, num_sample = validate(val_loader, model, global_model, args)
         acc_c = correct_c / num_sample * 100
-        print("Average accuracy after regularization cleaning on all Client: {}%".format(acc_c))
+        print(f"Average accuracy after regularization cleaning: {acc_c:.2f}%")
 
     endtime_2 = time.time() - start
-    print("Elapsing time plus cleansing regularization: {}%".format(endtime_2))
+    print(f"\nElapsing time plus cleansing regularization: {endtime_2:.2f} seconds")
+    
+    # Save results
     import csv
-    with open(args.dataset + args.arch + '_' + str(args.num_clients) + '_' + str(args.alpha) + '_' + str(args.shred) + '_' + str(args.partition)+ '.csv', mode='a+', encoding="ISO-8859-1",
-              newline='') as file:
-        data = (str(local_train_acc),) +  ('-',)+(str(acc.cpu().item()),)  + (str(acc_c.cpu().item()),) +  ('-',)   + (str(endtime),)  + (str(endtime_1),)  + (str(endtime_2),)+  ('-',) + (str(args),)
+    filename = f"{args.dataset}_{args.arch}_{args.num_clients}clients"
+    if args.continual:
+        filename += f"_continual_{args.tasks_per_client}tasks_{args.classes_per_task}classes"
+    else:
+        filename += f"_{args.alpha}_{args.shred}_{args.partition}"
+    filename += ".csv"
+    
+    with open(filename, mode='a+', encoding="ISO-8859-1", newline='') as file:
+        data = (
+            str(local_train_acc), '-', 
+            str(acc.cpu().item()), 
+            str(acc_c.cpu().item()), '-', 
+            str(endtime), 
+            str(endtime_1), 
+            str(endtime_2), '-', 
+            str(args)
+        )
         wr = csv.writer(file)
         wr.writerow(data)
-    print('written it to a csv file named {}.'.format(args.dataset + args.arch + '_' + str(args.num_clients) + '_' + str(args.alpha) + '.csv'))
-
+    
+    print(f'\nResults written to: {filename}')
 
 if __name__ == '__main__':
     main()
